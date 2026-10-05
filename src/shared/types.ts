@@ -850,7 +850,7 @@ const CAPABILITY_TOOLS: Record<Capability, readonly string[]> = {
   edit: ['apply_patch'],
   move: ['apply_patch'],
   deleteFile: ['apply_patch'],
-  command: ['exec_command', 'write_stdin'],
+  command: ['project_mcp', 'exec_command', 'write_stdin'],
   screen: ['observe'],
   control: ['computer'],
   clipboardRead: ['computer'],

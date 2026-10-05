@@ -163,6 +163,30 @@ function ruleMatches(rule: ParsedInvocation, args: readonly string[]): boolean {
   return rule.args.every((argument, index) => argument === args[index]);
 }
 
+// cross-spawn resolves the common Node package-manager launchers through their .cmd shims on
+// Windows. Treat only those bare names as one policy identity. Paths stay byte-for-byte exact:
+// a rule for C:\\tools\\npx.cmd must never authorize another C:\\... executable merely because
+// their basenames happen to match.
+const WINDOWS_NODE_CMD_SHIMS = new Set(['corepack', 'npm', 'npx', 'pnpm', 'pnpx', 'yarn', 'yarnpkg']);
+
+function tokenizedExecutableIdentity(executable: string, platform: NodeJS.Platform): string {
+  if (platform !== 'win32' || /[\\/]/.test(executable) || /^[A-Za-z]:/.test(executable)) return executable;
+  const lower = executable.toLowerCase();
+  const bare = lower.endsWith('.cmd') ? lower.slice(0, -4) : lower;
+  return WINDOWS_NODE_CMD_SHIMS.has(bare) ? bare : executable;
+}
+
+function tokenizedRuleMatches(
+  rule: ParsedInvocation,
+  args: readonly string[],
+  platform: NodeJS.Platform
+): boolean {
+  if (rule.wildcard ? args.length < rule.args.length : args.length !== rule.args.length) return false;
+  return rule.args.every((argument, index) => index === 0
+    ? tokenizedExecutableIdentity(argument, platform) === tokenizedExecutableIdentity(args[index]!, platform)
+    : argument === args[index]);
+}
+
 export function evaluateCommandAllowlist(
   policy: CommandAllowlistSettings,
   commands: readonly string[],
@@ -200,6 +224,35 @@ export function evaluateCommandAllowlist(
     }
   }
   return { allowed: true, args: parsed };
+}
+
+/** Apply the same saved policy to an already-tokenized executable + argv without inventing shell text. */
+export function evaluateCommandAllowlistArgs(
+  policy: CommandAllowlistSettings,
+  args: readonly string[],
+  platform: NodeJS.Platform = process.platform
+): CommandAllowlistDecision {
+  if (!policy.enabled) return { allowed: true, args: [Array.from(args)] };
+  if (policy.mode !== 'allow' && policy.mode !== 'deny') {
+    return { allowed: false, commandIndex: 0, kind: 'invalid-policy', detail: 'Saved command policy mode is invalid.' };
+  }
+  if (!args.length || args.some(argument => typeof argument !== 'string')) {
+    return { allowed: false, commandIndex: 0, kind: 'unsupported', detail: 'The executable argument list is invalid.' };
+  }
+  const rules: ParsedInvocation[] = [];
+  for (const [index, rule] of policy.rules.entries()) {
+    const message = validateCommandAllowlistRule(rule);
+    if (message) return { allowed: false, commandIndex: 0, kind: 'invalid-policy', detail: `Saved rule ${index + 1} is invalid: ${message}` };
+    rules.push(parseInvocation(rule.trim(), 'neutral', 'rule'));
+  }
+  const matchedRule = rules.findIndex(rule => tokenizedRuleMatches(rule, args, platform));
+  if (policy.mode === 'allow' && matchedRule === -1) {
+    return { allowed: false, commandIndex: 0, kind: 'unmatched', detail: 'No allowlist rule matched the executable and complete argument list.' };
+  }
+  if (policy.mode === 'deny' && matchedRule !== -1) {
+    return { allowed: false, commandIndex: 0, kind: 'denied', detail: `Denylist rule ${matchedRule + 1} matched the executable and complete argument list.` };
+  }
+  return { allowed: true, args: [Array.from(args)] };
 }
 
 export function commandHasSameArguments(expected: readonly string[], command: string, shell: CommandAllowlistShell): boolean {

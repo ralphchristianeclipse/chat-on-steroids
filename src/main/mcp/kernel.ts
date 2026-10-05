@@ -726,6 +726,7 @@ async function dispatchTracked(
   // handler runs. Recording a late identity cannot recover a discarded anonymous frame.
   const desktopContext = surface === 'desktop' && (name === 'get_window_state' ||
     (WINDOWS_COMPUTER_STATE_INPUT_METHODS as readonly string[]).includes(name));
+  const projectMcpContext = surface === 'core' && name === 'project_mcp';
   // Identity and the finish hold share one ingress deadline; late proof must not
   // add another complete hold interval to an already waiting provider request.
   const finishDeadline = name === 'session_finish' ? sessionFinishDeadline(startedAt) : null;
@@ -734,7 +735,7 @@ async function dispatchTracked(
   // Windows observation/input gets one short grace even under the opt-in. Exact proof can then
   // alias the observation directly to the durable session, while a genuinely headless caller
   // falls back to its request principal instead of waiting the old full identity window.
-  const needsExactIdentity = name === 'session_finish' || desktopContext || (!allowUnattributed && (
+  const needsExactIdentity = name === 'session_finish' || desktopContext || projectMcpContext || (!allowUnattributed && (
     name === 'exec' || name === 'update_plan' || (identitySensitive && swarmRunning())
   ));
   if (!context.caller.conversationId && needsExactIdentity && requestId) {

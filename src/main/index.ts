@@ -32,6 +32,7 @@ import { mainText, mainTextTranslations, onMainTextsChange, restoreMainTextTrans
 import { isMainText } from '../shared/main-texts.js';
 import { executableFingerprint, initKeychainNotice } from './keychain-notice.js';
 import { pluginManager } from './plugins/manager.js';
+import { projectMcpManager } from './project-mcp/runtime.js';
 import { setBrowserOpener, setBrowserWorkArea, shutdownBridge, startBridge } from './bridge.js';
 import { setStuckNotifier } from './stuck-notice.js';
 import { flushSessions, initSessionStore } from './session/store.js';
@@ -680,8 +681,8 @@ app.on('will-quit', (event) => {
       {
         name: 'process cleanup',
         budgetMs: 15_000,
-        run: () => [unifiedExecManager.terminateAllProcesses(), workspaceTerminalsExited(), stopComputerHelper(), shutdownPetOverlay(), pluginManager.close(),
-          Promise.resolve().then(() => loadedCosBrowser()?.stop())]
+        run: () => [unifiedExecManager.terminateAllProcesses(), stopComputerHelper(), shutdownPetOverlay(), pluginManager.close(),
+          workspaceTerminalsExited(), projectMcpManager.close(), Promise.resolve().then(() => loadedCosBrowser()?.stop())]
       },
       // Phase 3: recorder work can enqueue both session projections and named durable state.
       { name: 'recorder flush', budgetMs: 10_000, run: () => [flushRecorder()] },

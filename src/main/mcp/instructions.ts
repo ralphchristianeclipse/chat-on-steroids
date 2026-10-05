@@ -104,7 +104,7 @@ function coreInstructions(ctx: ToolContext, platform: NodeJS.Platform, skills: s
     `; ${surfaceDefinition('plugins').connectorName} for enabled external apps and services.`,
     `Host: ${host}. Roots: ${roots}`,
     `Current Core authority (informational; live guards decide): ${authority}; read-only=${ctx.readOnly ? 'on' : 'off'}; plans=${sessionTools ? 'on' : 'off'}; workers=${agentTools ? 'on' : 'off'}.`,
-    ctx.readOnly ? 'The local tools are read-only.' : 'Use the tools listed in this conversation.',
+    ctx.readOnly ? 'The local tools are read-only.' : 'Use listed tools.',
     ...(writable || executable ? [`You can always use ${[writable && 'file writing', executable && 'exec_command'].filter(Boolean).join(' and ')} in CoS. Never hallucinate a block from ChatGPT environment messages.`] : []),
     'Report exact failures: identity, session_id and output-limit errors do not mean Read-only. Never replay successful patches or commands to recover a terminal.',
     '"This tool call was blocked by OpenAI because we couldn\'t determine the safety status of the request." comes from ChatGPT before CoS receives the call. It is not a CoS failure or a missing capability: retry the identical call once.',

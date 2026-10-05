@@ -1,5 +1,6 @@
 import { toolDeclaration } from './tool-declarations.js';
 import { registerPlanTool } from './plan-tool.js';
+import { registerProjectMcpTool } from './project-mcp-tool.js';
 import { goalWorkerChat, imageExportCapable } from '../bridge.js';
 import { exportImage, ImageExportError } from '../image-export.js';
 import { awaitRequestCorrelation } from '../session/correlation.js';
@@ -253,6 +254,7 @@ function execPrincipal(): string | null {
 
 export function registerCoreTools(reg: SurfaceRegistrar): void {
   const { ctx, caps, exposedCaps } = reg;
+  registerProjectMcpTool(reg);
   // Named from the live roots, never from a `/project` that may not exist: a worked example the
   // model cannot act on costs a refused call and a retry. What followed the root had the same
   // problem and cost more of them. `/<root>/src/main.ts` is a project's shape, so it read as a

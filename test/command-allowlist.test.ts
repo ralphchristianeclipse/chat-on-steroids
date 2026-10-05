@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   commandHasSameArguments,
   evaluateCommandAllowlist,
+  evaluateCommandAllowlistArgs,
   parseCommandAllowlistText,
   validateCommandAllowlistRule
 } from '../src/shared/command-allowlist.js';
@@ -10,6 +11,29 @@ import { normalizeShellCommand } from '../src/main/exec-hints.js';
 const enabled = (rules: string[], mode: 'allow' | 'deny' = 'allow') => ({ enabled: true, mode, rules });
 
 describe('command allowlist', () => {
+  it('applies the same exact/wildcard policy to a pre-tokenized executable argv', () => {
+    expect(evaluateCommandAllowlistArgs(enabled(['node server.js *']), ['node', 'server.js', '--stdio']).allowed).toBe(true);
+    expect(evaluateCommandAllowlistArgs(enabled(['node server.js']), ['node', 'server.js', '--stdio'])).toMatchObject({ allowed: false, kind: 'unmatched' });
+    expect(evaluateCommandAllowlistArgs(enabled(['node server.js *'], 'deny'), ['node', 'server.js', '--stdio'])).toMatchObject({ allowed: false, kind: 'denied' });
+  });
+
+  it('treats bare Windows Node package-manager shims and their .cmd spellings as one policy identity', () => {
+    for (const [rule, command] of [
+      ['npx *', ['npx.cmd', '-y', '@playwright/mcp']],
+      ['npx.cmd *', ['npx', '-y', '@playwright/mcp']]
+    ] as const) {
+      expect(evaluateCommandAllowlistArgs(enabled([rule]), command, 'win32').allowed).toBe(true);
+      expect(evaluateCommandAllowlistArgs(enabled([rule], 'deny'), command, 'win32')).toMatchObject({ allowed: false, kind: 'denied' });
+    }
+  });
+
+  it('keeps explicit Windows executable paths exact while normalizing bare .cmd shims', () => {
+    expect(evaluateCommandAllowlistArgs(
+      enabled(['"C:\\tools\\npx.cmd" *']),
+      ['C:\\tools\\npx', '-y', '@playwright/mcp'],
+      'win32'
+    )).toMatchObject({ allowed: false, kind: 'unmatched' });
+  });
   it('matches exact argument boundaries and rejects additions', () => {
     expect(evaluateCommandAllowlist(enabled(['git status']), ['git status'], 'powershell').allowed).toBe(true);
     expect(evaluateCommandAllowlist(enabled(['git status']), ['git status-other'], 'powershell').allowed).toBe(false);

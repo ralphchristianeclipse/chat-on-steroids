@@ -139,6 +139,29 @@ The extension observes ChatGPT and performs authorized browser orchestration. It
 the model's local tool. The main process is authoritative about what a local tool actually did.
 The renderer has no direct filesystem, command, secret or generic main-process authority.
 
+Core also owns one fixed `project_mcp` broker for MCP servers available to the chat's selected
+local project. It first reads the trusted user Codex MCP registry (`$CODEX_HOME/config.toml` when
+that absolute path is set, otherwise `~/.codex/config.toml`), then layers that project's
+`.mcp.json` and `.codex/config.toml` on top. Project files may add, override or disable servers,
+but cannot import arbitrary host env secrets; trusted user `env_vars`/header-env declarations may.
+An inherited stdio server with no explicit cwd starts from the selected project root, so tools such
+as Serena `--project-from-cwd` bind to the right project. The broker never scans project parents or
+publishes downstream project tool names into Core `tools/list`. Exact session identity selects the
+project, current roots are revalidated, discovery starts configured servers lazily, and opaque tool
+ids are invalidated when either user or project MCP configuration changes. Stdio launches require
+both live Read/Run-command authority and the saved command policy; repository-supplied environment
+overrides stay blocked while command allowlisting is active. HTTP endpoints are limited to
+private-LAN/loopback HTTP(S), without URL credentials/query tokens, while public remote MCPs remain
+managed Plugins. Search words are alternatives across server name, tool name and description, and
+independent server discovery uses bounded concurrency so one cold server does not serialize every
+other configured server. Ambiguous failed calls are never retried automatically.
+The single Core `project_mcp` schema also supports compact search (tool names/ids/descriptions),
+`describe` for a selected schema, and opt-in cached searches of already-live server catalogs.
+Full-schema/fresh search remains the default for compatibility; calls always revalidate the
+upstream live tool schema before dispatch even after cached discovery. Broker responses identify
+the selected project and, for resolved calls, the downstream server/tool in their text result;
+ChatGPT's fixed top-level tool-call label remains owned by the client, not this MCP server.
+
 ### Identify the boundary before debugging
 
 | Boundary | Identity that must survive |

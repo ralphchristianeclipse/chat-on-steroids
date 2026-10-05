@@ -63,6 +63,7 @@ describe('portable browser-backed feature parity', () => {
     // Darwin release of the machine running Vitest.
     const config = defaultConfig('darwin', '21.4.0');
     expect(surfaceDefinition('core').tools).toEqual([
+      'project_mcp',
       'read',
       'view_image',
       'find',
