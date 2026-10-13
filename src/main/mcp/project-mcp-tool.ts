@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { z } from 'zod';
 import { projectMcpManager } from '../project-mcp/runtime.js';
-import { getConfig } from '../config.js';
+import { effectiveCapabilities, getConfig } from '../config.js';
 import { listProjects, projectWorkspace } from '../projects.js';
 import { rawPromises as fs } from '../rawfs.js';
 import { nativePathIdentity, resolvePath } from '../sandbox.js';
@@ -104,17 +104,27 @@ export function registerProjectMcpTool(reg: SurfaceRegistrar): void {
       ? fail('PROJECT_REQUIRED: Select a local project for this chat, or first establish this exact chat\'s workspace by using an approved folder with a local file/command tool.')
       : failIdentity('PROJECT_IDENTITY_REQUIRED: Exact local session identity is required before using project MCP tools.');
     const project = label(path.basename(owned.workspace));
+    const stillAuthorized = async (): Promise<boolean> => {
+      try {
+        const settings = getConfig();
+        const current = await scope();
+        const caps = effectiveCapabilities(getConfig());
+        return settings === getConfig() && caps.read && caps.command &&
+          current?.scopeId === owned.scopeId &&
+          nativePathIdentity(current.workspace) === nativePathIdentity(owned.workspace);
+      } catch { return false; }
+    };
     if (action === 'call') {
       const target: { server?: string; tool?: string } = {};
       const result = await projectMcpManager.call(owned.scopeId, owned.workspace, tool_id!, args ?? {},
-        (resolvedServer, tool) => { target.server = resolvedServer; target.tool = tool; });
+        (resolvedServer, tool) => { target.server = resolvedServer; target.tool = tool; }, stillAuthorized);
       const identification = target.server && target.tool
         ? `Project MCP | Project: ${project} | Tool: ${label(target.server)}.${label(target.tool)}`
         : `Project MCP | Project: ${project} | Tool: not resolved`;
       return { ...result, content: [{ type: 'text' as const, text: identification }, ...result.content] };
     }
     if (action === 'describe') {
-      const entry = await projectMcpManager.describe(owned.scopeId, owned.workspace, tool_id!);
+      const entry = await projectMcpManager.describe(owned.scopeId, owned.workspace, tool_id!, stillAuthorized);
       if (!entry) return fail('MCP_TOOL_STALE: Search this project MCP catalog again; the tool id is absent or its project/config changed. No tool was invoked.');
       return {
         content: [{ type: 'text' as const, text: `Project MCP | Project: ${project} | Tool: ${label(entry.server)}.${label(entry.tool.name)} | Schema retrieved` }],
@@ -126,7 +136,7 @@ export function registerProjectMcpTool(reg: SurfaceRegistrar): void {
         }
       };
     }
-    const result = await projectMcpManager.search(owned.scopeId, owned.workspace, query ?? '', server, cached, compact);
+    const result = await projectMcpManager.search(owned.scopeId, owned.workspace, query ?? '', server, cached, compact, stillAuthorized);
     const tools = result.tools.map(entry => ({
       tool_id: entry.id, server: entry.server, name: entry.tool.name,
       description: entry.tool.description ? redactCredentialText(entry.tool.description) : '',

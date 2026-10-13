@@ -8,16 +8,16 @@ import { rawPromises as fs } from '../rawfs.js';
 import { terminateProcessTree } from '../exec.js';
 import { pluginEnvironment } from '../plugins/installer.js';
 import { envValue, setEnvValue } from '../env.js';
-import { redactCredentialText, redactSecretText } from '../redaction.js';
-import { getConfig } from '../config.js';
-import { isContained } from '../sandbox.js';
+import { redactSecretText } from '../redaction.js';
+import { getConfig, onConfigPublished } from '../config.js';
+import { isContained, nativePathIdentity, resolvePath } from '../sandbox.js';
 import { evaluateCommandAllowlistArgs } from '../../shared/command-allowlist.js';
 import { loadProjectMcpConfig, type ProjectMcpServerConfig } from './config.js';
 import type { ToolResult } from '../mcp/kernel.js';
 
 interface LiveServer { client: Client; transport?: StdioClientTransport; tools: Tool[] }
 interface ConnectingServer { client: Client; transport?: StdioClientTransport }
-interface ServerState { config: ProjectMcpServerConfig; projectRoot: string; live?: LiveServer; pending?: Promise<LiveServer>; connecting?: ConnectingServer; retired: boolean }
+interface ServerState { config: ProjectMcpServerConfig; projectRoot: string; live?: LiveServer; pending?: Promise<LiveServer>; connecting?: ConnectingServer; retired: boolean; retirementPids?: number[] }
 interface CatalogTool { id: string; server: string; tool: Tool }
 interface ProjectState { fingerprint: string; workspace: string; servers: Map<string, ServerState>; catalog: Map<string, CatalogTool> }
 
@@ -84,7 +84,9 @@ function redactText(text: string, secrets: readonly string[] = []): string {
 function redactValue(value: unknown, secrets: readonly string[] = []): unknown {
   if (typeof value === 'string') return redactText(value, secrets);
   if (Array.isArray(value)) return value.map(entry => redactValue(entry, secrets));
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, redactValue(entry, secrets)]));
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+    redactText(key, secrets), redactValue(entry, secrets)
+  ]));
   return value;
 }
 
@@ -124,11 +126,36 @@ async function closeLive(live: LiveServer | undefined): Promise<void> {
 async function retireServer(server: ServerState): Promise<void> {
   server.retired = true;
   const connecting = server.connecting;
-  if (connecting?.transport?.pid) await terminateProcessTree(connecting.transport.pid, true).catch(() => undefined);
-  if (connecting) await connecting.client.close().catch(() => undefined);
-  await closeLive(server.live);
-  server.live = undefined;
+  const pids = [...new Set([
+    ...(server.retirementPids ?? []), connecting?.transport?.pid, server.live?.transport?.pid
+  ].filter((pid): pid is number => typeof pid === 'number' && pid > 0))];
+  // Preserve the original process identities until tree termination is confirmed.
+  // A fallback parent-only kill on Windows is not proof grandchildren stopped.
+  server.retirementPids = pids;
+  const stopped = await Promise.allSettled(pids.map(pid => terminateProcessTree(pid, true, 1000, true)));
+  await Promise.allSettled([
+    ...(connecting ? [connecting.client.close()] : []),
+    ...(server.live ? [server.live.client.close()] : [])
+  ]);
   if (server.pending) await server.pending.catch(() => undefined);
+  let alive = false;
+  for (const pid of pids) {
+    let gone = false;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      try { process.kill(pid, 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ESRCH') { gone = true; break; }
+      }
+      if (attempt === 9) break;
+      await new Promise(resolve => setTimeout(resolve, 35));
+    }
+    if (!gone) alive = true;
+  }
+  if (alive || stopped.some(result => result.status === 'rejected')) {
+    throw new Error('MCP_RETIRE_INCOMPLETE: The downstream process tree could not be confirmed stopped.');
+  }
+  server.retirementPids = [];
+  server.live = undefined;
 }
 
 function privateIp(hostname: string): boolean {
@@ -195,11 +222,57 @@ export async function resolveProjectMcpWindowsCommand(
 
 export class ProjectMcpManager {
   private projects = new Map<string, ProjectState>();
+  private retiring = new Set<ServerState>();
   private prepareTails = new Map<string, Promise<void>>();
   private searchTails = new Map<string, Promise<void>>();
   private closing = false;
+  private revision = 0;
+  private unsubscribeConfig: () => void;
 
-  constructor(private userConfigPath: string | null | undefined = undefined) {}
+  constructor(private userConfigPath: string | null | undefined = undefined) {
+    this.unsubscribeConfig = onConfigPublished((next, previous) => this.settingsChanged(next, previous));
+  }
+
+  private async retireServers(servers: readonly ServerState[]): Promise<void> {
+    for (const server of servers) { server.retired = true; this.retiring.add(server); }
+    const results = await Promise.allSettled([...this.retiring].map(async server => {
+      await retireServer(server);
+      this.retiring.delete(server);
+    }));
+    if (results.some(result => result.status === 'rejected')) {
+      throw new Error('MCP_RETIRE_INCOMPLETE: One or more managed MCP processes could not be confirmed stopped.');
+    }
+  }
+
+  private async settingsChanged(next: ReturnType<typeof getConfig>, previous: ReturnType<typeof getConfig>): Promise<void> {
+    const policyChanged = JSON.stringify(next.commandAllowlist) !== JSON.stringify(previous.commandAllowlist);
+    const authorityChanged = next.readOnly !== previous.readOnly ||
+      next.capabilities.read !== previous.capabilities.read ||
+      next.capabilities.command !== previous.capabilities.command;
+    const rootsChanged = JSON.stringify(next.roots) !== JSON.stringify(previous.roots);
+    if (!policyChanged && !authorityChanged && !rootsChanged && !this.retiring.size) return;
+    if (policyChanged || authorityChanged || rootsChanged) this.revision++;
+    const retiring: ProjectState[] = [];
+    for (const [id, state] of this.projects) {
+      let revoked = policyChanged || authorityChanged;
+      if (rootsChanged && !revoked) {
+        const resolved = await resolvePath(next.roots, state.workspace).catch(() => null);
+        revoked = !resolved || nativePathIdentity(resolved.real) !== nativePathIdentity(state.workspace);
+      }
+      if (revoked) { this.projects.delete(id); retiring.push(state); }
+    }
+    await this.retireServers(retiring.flatMap(state => [...state.servers.values()]));
+  }
+
+  private assertCommandPolicy(server: ServerState): void {
+    if (server.config.transport !== 'stdio') return;
+    const policy = getConfig().commandAllowlist;
+    const decision = evaluateCommandAllowlistArgs(policy, [server.config.command ?? '', ...server.config.args]);
+    if (!decision.allowed) throw new Error(`COMMAND_NOT_ALLOWED: ${decision.detail} No project MCP tool was invoked.`);
+    if (policy.enabled && server.config.projectEnvironment) {
+      throw new Error('COMMAND_NOT_ALLOWED: Project MCP environment overrides are disabled while the command allowlist is enabled.');
+    }
+  }
 
   setUserConfigPathForTest(pathValue: string | null | undefined): void {
     if (this.projects.size || this.prepareTails.size || this.searchTails.size) throw new Error('Project MCP runtime is already active');
@@ -214,14 +287,20 @@ export class ProjectMcpManager {
     const currentTail = previousTail.catch(() => undefined).then(() => tail);
     this.prepareTails.set(projectId, currentTail);
     await previousTail.catch(() => undefined);
+    const expectedRevision = this.revision;
     try {
-      if (this.closing) throw new Error('Project MCP runtimes are shutting down');
+      if (this.closing || expectedRevision !== this.revision) {
+        throw new Error('Project MCP authorization changed while preparing the server registry');
+      }
       const loaded = await loadProjectMcpConfig(workspace, { userConfigPath: this.userConfigPath });
-      const fingerprint = hash(JSON.stringify(loaded.servers));
+      if (expectedRevision !== this.revision) throw new Error('Project MCP authorization changed while loading configuration');
+      const fingerprint = hash(JSON.stringify({ servers: loaded.servers, commandAllowlist: getConfig().commandAllowlist }));
       const previous = this.projects.get(projectId);
       if (previous?.fingerprint === fingerprint && previous.workspace === workspace) return previous;
-      if (previous) await Promise.allSettled([...previous.servers.values()].map(retireServer));
-      if (this.closing) throw new Error('Project MCP runtimes are shutting down');
+      if (previous) await this.retireServers([...previous.servers.values()]);
+      if (this.closing || expectedRevision !== this.revision) {
+        throw new Error('Project MCP authorization changed before publishing the server registry');
+      }
       const next: ProjectState = {
         fingerprint, workspace,
         servers: new Map(loaded.servers.map(config => [config.name, { config, projectRoot: workspace, retired: false }])),
@@ -265,6 +344,7 @@ export class ProjectMcpManager {
 
   private async connect(server: ServerState): Promise<LiveServer> {
     if (this.closing || server.retired) throw new Error(`Project MCP ${server.config.name} configuration changed or is shutting down`);
+    this.assertCommandPolicy(server);
     if (server.live) return server.live;
     if (server.pending) return server.pending;
     const pending = (async () => {
@@ -278,11 +358,6 @@ export class ProjectMcpManager {
           // Authorize exactly what the project declared. On Windows cross-spawn may execute the
           // common Node package-manager .cmd shims through cmd.exe; the tokenized policy matcher
           // treats bare npx/npm/etc. and their .cmd spellings as the same executable identity.
-          const policy = evaluateCommandAllowlistArgs(getConfig().commandAllowlist, [config.command, ...config.args]);
-          if (!policy.allowed) throw new Error(`COMMAND_NOT_ALLOWED: ${policy.detail} No project MCP process was started.`);
-          if (getConfig().commandAllowlist.enabled && config.projectEnvironment) {
-            throw new Error('COMMAND_NOT_ALLOWED: Project MCP environment overrides are disabled while the command allowlist is enabled because they can change executable/interpreter behavior.');
-          }
           const env = pluginEnvironment();
           const launchCommand = await resolveProjectMcpWindowsCommand(config.command, server.projectRoot, env);
           for (const key of config.envVars) {
@@ -292,6 +367,8 @@ export class ProjectMcpManager {
           for (const [key, value] of Object.entries(config.env)) setEnvValue(env, key, value);
           transport = new StdioClientTransport({ command: launchCommand, args: config.args, cwd: config.cwd, env, stderr: 'ignore', maxBufferSize: 16 * 1024 * 1024 });
           server.connecting.transport = transport;
+          this.assertCommandPolicy(server);
+          if (server.retired || this.closing) throw new Error('Project MCP authorization changed before process launch');
           await client.connect(transport, { timeout: config.startupTimeoutMs });
         } else {
           if (!config.url) throw new Error(`Project MCP ${config.name} has no URL`);
@@ -321,13 +398,19 @@ export class ProjectMcpManager {
     return pending;
   }
 
-  private async searchNow(projectId: string, workspace: string, query = '', serverName?: string, cached = false, compact = false): Promise<{ tools: CatalogTool[]; errors: string[] }> {
+  private async searchNow(projectId: string, workspace: string, query = '', serverName?: string,
+    cached = false, compact = false, stillAuthorized?: () => Promise<boolean>): Promise<{ tools: CatalogTool[]; errors: string[] }> {
     const state = await this.prepare(projectId, workspace);
+    if (stillAuthorized && !(await stillAuthorized())) {
+      await this.retireIfRootRevoked(projectId, state);
+      throw new Error('MCP_AUTH_REVOKED: Project or tool permission changed before discovery. No server was started.');
+    }
     const errors: string[] = [];
     const servers = [...state.servers.values()].filter(server => server.config.enabled && (!serverName || server.config.name === serverName));
     const refreshed = new Set(servers.map(server => server.config.name));
-    for (const [id, entry] of state.catalog) if (refreshed.has(entry.server)) state.catalog.delete(id);
-    let catalogBytes = [...state.catalog.values()].reduce(
+    const nextCatalog = new Map(state.catalog);
+    for (const [id, entry] of nextCatalog) if (refreshed.has(entry.server)) nextCatalog.delete(id);
+    let catalogBytes = [...nextCatalog.values()].reduce(
       (sum, entry) => sum + Buffer.byteLength(JSON.stringify({ id: entry.id, server: entry.server, tool: entry.tool })),
       0
     );
@@ -353,7 +436,8 @@ export class ProjectMcpManager {
     });
     for (const discovery of discoveries) {
       if ('error' in discovery) {
-        const detail = redactCredentialText(discovery.error instanceof Error ? discovery.error.message : String(discovery.error))
+        const detail = redactText(discovery.error instanceof Error ? discovery.error.message : String(discovery.error),
+          configuredSecrets(discovery.server.config))
           .split(state.workspace).join('<project>');
         errors.push(`${discovery.server.config.name}: ${detail}`.slice(0, 600));
         continue;
@@ -362,9 +446,17 @@ export class ProjectMcpManager {
         errors.push(`${discovery.server.config.name}: Project MCP catalog exceeds the 2 MiB project limit`);
         continue;
       }
-      for (const entry of discovery.discovered) state.catalog.set(entry.id, entry);
+      for (const entry of discovery.discovered) nextCatalog.set(entry.id, entry);
       catalogBytes += discovery.discoveredBytes;
     }
+    if (stillAuthorized && !(await stillAuthorized())) {
+      await this.retireIfRootRevoked(projectId, state);
+      throw new Error('MCP_AUTH_REVOKED: Project or tool permission changed during discovery. No tools were returned.');
+    }
+    if (this.projects.get(projectId) !== state || [...state.servers.values()].some(server => server.retired)) {
+      throw new Error('Project MCP authorization or configuration changed during discovery');
+    }
+    state.catalog = nextCatalog;
     const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
     const tools = [...state.catalog.values()].filter(entry => {
       if (serverName && entry.server !== serverName) return false;
@@ -390,7 +482,16 @@ export class ProjectMcpManager {
     };
   }
 
-  async search(projectId: string, workspace: string, query = '', serverName?: string, cached = false, compact = false): Promise<{ tools: CatalogTool[]; errors: string[] }> {
+  private async retireIfRootRevoked(projectId: string, state: ProjectState): Promise<void> {
+    const resolved = await resolvePath(getConfig().roots, state.workspace).catch(() => null);
+    if (resolved && nativePathIdentity(resolved.real) === nativePathIdentity(state.workspace)) return;
+    if (this.projects.get(projectId) !== state) return;
+    this.projects.delete(projectId);
+    await this.retireServers([...state.servers.values()]);
+  }
+
+  async search(projectId: string, workspace: string, query = '', serverName?: string,
+    cached = false, compact = false, stillAuthorized?: () => Promise<boolean>): Promise<{ tools: CatalogTool[]; errors: string[] }> {
     const previousTail = this.searchTails.get(projectId) ?? Promise.resolve();
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
@@ -398,7 +499,7 @@ export class ProjectMcpManager {
     this.searchTails.set(projectId, currentTail);
     await previousTail.catch(() => undefined);
     try {
-      return await this.searchNow(projectId, workspace, query, serverName, cached, compact);
+      return await this.searchNow(projectId, workspace, query, serverName, cached, compact, stillAuthorized);
     } finally {
       release();
       if (this.searchTails.get(projectId) === currentTail) this.searchTails.delete(projectId);
@@ -408,27 +509,48 @@ export class ProjectMcpManager {
   /** Describes the last searched catalog entry without another downstream tools/list request.
    * Calls still revalidate the live schema before dispatch, including silent changes.
    */
-  async describe(projectId: string, workspace: string, toolId: string): Promise<CatalogTool | null> {
+  async describe(projectId: string, workspace: string, toolId: string,
+    stillAuthorized?: () => Promise<boolean>): Promise<CatalogTool | null> {
     const state = await this.prepare(projectId, workspace);
+    if (stillAuthorized && !(await stillAuthorized())) {
+      await this.retireIfRootRevoked(projectId, state);
+      return null;
+    }
     const entry = state.catalog.get(toolId);
     const config = entry && state.servers.get(entry.server)?.config;
     if (!entry || !config?.enabled) return null;
     return { ...entry, tool: redactValue(entry.tool, configuredSecrets(config)) as Tool };
   }
 
-  async call(projectId: string, workspace: string, toolId: string, args: Record<string, unknown>, onResolved?: (server: string, tool: string) => void): Promise<ToolResult> {
+  async call(projectId: string, workspace: string, toolId: string, args: Record<string, unknown>,
+    onResolved?: (server: string, tool: string) => void, beforeDispatch?: () => Promise<boolean>): Promise<ToolResult> {
     const state = await this.prepare(projectId, workspace);
     const entry = state.catalog.get(toolId);
     if (!entry) return errorResult('MCP_TOOL_STALE: Search this project MCP catalog again; the tool id is absent or its project/config changed. This call was not dispatched.');
     const server = state.servers.get(entry.server);
     if (!server?.config.enabled) return errorResult('MCP_SERVER_DISABLED: The project MCP server is disabled. This call was not dispatched.');
     try {
+      if (beforeDispatch && !(await beforeDispatch())) {
+        await this.retireIfRootRevoked(projectId, state);
+        return errorResult('MCP_AUTH_REVOKED: Project or tool permission changed before connection. No tool was invoked.');
+      }
       const live = await this.connect(server);
       live.tools = await this.discover(live.client, server.config);
       const current = live.tools.find(tool => tool.name === entry.tool.name);
       if (!current) return errorResult('MCP_TOOL_STALE: The server tool list changed. Search again before calling it. This call was not dispatched.');
       if (this.toolId(projectId, state.fingerprint, server.config.name, current) !== toolId) {
         return errorResult('MCP_TOOL_STALE: The server tool schema changed. Search again before calling it. This call was not dispatched.');
+      }
+      if (this.projects.get(projectId) !== state || server.retired || this.closing) {
+        return errorResult('MCP_AUTH_REVOKED: Project MCP authorization changed before dispatch. No tool was invoked.');
+      }
+      this.assertCommandPolicy(server);
+      if (beforeDispatch && !(await beforeDispatch())) {
+        return errorResult('MCP_AUTH_REVOKED: Project or tool permission changed before dispatch. No tool was invoked.');
+      }
+      this.assertCommandPolicy(server);
+      if (server.retired || this.projects.get(projectId) !== state) {
+        return errorResult('MCP_AUTH_REVOKED: Project MCP authorization changed before dispatch. No tool was invoked.');
       }
       onResolved?.(entry.server, current.name);
       const result = await live.client.callTool({ name: current.name, arguments: args }, { timeout: server.config.toolTimeoutMs, toolDefinition: current });
@@ -449,10 +571,11 @@ export class ProjectMcpManager {
 
   async close(): Promise<void> {
     this.closing = true;
+    this.unsubscribeConfig();
     const servers = [...this.projects.values()].flatMap(project => [...project.servers.values()]);
     this.projects.clear();
     this.searchTails.clear();
-    await Promise.allSettled(servers.map(retireServer));
+    await this.retireServers(servers);
   }
 }
 

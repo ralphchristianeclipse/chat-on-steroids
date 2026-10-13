@@ -204,7 +204,8 @@ function findTaskkill(): string | null {
 export async function terminateProcessTree(
   pid: number,
   force = true,
-  helperTimeoutMs = force ? 1_000 : 500
+  helperTimeoutMs = force ? 1_000 : 500,
+  requireTreeKill = false
 ): Promise<void> {
   // child.kill() leaves grandchildren running on Windows; taskkill /T handles the tree.
   // taskkill itself can block while waiting on an uncooperative console process, so
@@ -258,6 +259,9 @@ export async function terminateProcessTree(
     } catch {
       /* already gone */
     }
+    // A strict owner cannot report complete revocation after the fallback: direct
+    // process.kill may leave grandchildren that taskkill /T would have terminated.
+    if (requireTreeKill) throw new Error('Process tree termination could not be confirmed');
     return;
   }
   // POSIX has a first-class process-group primitive. Every child this module owns is

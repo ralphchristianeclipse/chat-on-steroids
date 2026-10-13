@@ -155,6 +155,16 @@ private-LAN/loopback HTTP(S), without URL credentials/query tokens, while public
 managed Plugins. Search words are alternatives across server name, tool name and description, and
 independent server discovery uses bounded concurrency so one cold server does not serialize every
 other configured server. Ambiguous failed calls are never retried automatically.
+Published Settings changes retire affected server processes before reporting a completed update,
+including revoked Folders, Read/Run permissions and changed command policy. If process-tree
+retirement cannot be confirmed, the revoked authority stays off, the process owner remains tracked
+for retry, and Settings reports a saved-but-incomplete cleanup rather than silently succeeding.
+Both an already-connected stdio
+server and a pending tool dispatch must satisfy current authorization; a call waiting on downstream
+discovery checks its originating chat's project again before invoking the tool. Search replaces
+per-project tool catalogs atomically so another chat's describe/call cannot see an empty mid-refresh
+catalog; malformed paths of disabled servers cannot block unrelated enabled servers. MCP results,
+including error text and structured JSON property names, mask recognized/imported credentials.
 The single Core `project_mcp` schema also supports compact search (tool names/ids/descriptions),
 `describe` for a selected schema, and opt-in cached searches of already-live server catalogs.
 Full-schema/fresh search remains the default for compatibility; calls always revalidate the

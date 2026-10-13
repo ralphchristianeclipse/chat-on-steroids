@@ -320,6 +320,8 @@ export async function loadProjectMcpConfig(workspace: string, options: ProjectMc
   const toml = await optional(codexPath, workspaceReal);
   if (toml !== null) { apply(patches(parse(toml), 'mcp_servers', codexPath, workspaceReal, 'project')); sourcePaths.push(codexPath); }
   for (const server of registry.values()) {
+    // Disabled entries never launch; stale cwd paths must not block enabled servers.
+    if (!server.enabled) continue;
     const cwdReal = await fs.realpath(server.cwd).catch(() => { throw new Error(`Project MCP ${server.name} cwd does not exist`); });
     if (!isContained(workspaceReal, cwdReal)) throw new Error(`Project MCP ${server.name} cwd leaves the selected project folder`);
     const stat = await fs.stat(cwdReal);

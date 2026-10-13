@@ -760,6 +760,14 @@ export function getConfig(): Config {
   return current;
 }
 
+const configPublishedListeners = new Set<(next: Config, previous: Config) => void | Promise<void>>();
+let postCommitCleanupError: Error | null = null;
+/** Consumers that retain executable authority must reconcile it when Settings commits. */
+export function onConfigPublished(listener: (next: Config, previous: Config) => void | Promise<void>): () => void {
+  configPublishedListeners.add(listener);
+  return () => { configPublishedListeners.delete(listener); };
+}
+
 /**
  * Read-only mode is enforced here as well as at the tool layer, so the effective
  * capability set can never disagree with what the UI shows.
@@ -785,8 +793,18 @@ async function persistConfig(parsed: Config): Promise<Config> {
   await fs.rename(tmp, configPath);
   // Only publish the new in-memory state after the durable write succeeded. A disk
   // error must not leave the UI believing settings were saved when they were not.
+  const previousConfig = current;
   current = parsed;
   if (!parsed.readOnly) recovered = false;
+  // A permission or Folder revocation must finish retiring managed processes before
+  // Settings reports the save complete. The config is already durable, so explicitly
+  // report any incomplete cleanup instead of falsely claiming a finished revocation.
+  const notifications = await Promise.allSettled([...configPublishedListeners].map(
+    listener => Promise.resolve().then(() => listener(current, previousConfig))
+  ));
+  if (notifications.some(result => result.status === 'rejected')) {
+    postCommitCleanupError = new Error('Settings were saved and tool permission was revoked, but an MCP process could not be confirmed stopped. Restart the app and verify process cleanup.');
+  }
   return current;
 }
 
@@ -804,6 +822,7 @@ export function updateConfig(
   publish?: (next: Config, previous: Config, persist: () => Promise<Config>) => Promise<Config>
 ): Promise<Config> {
   const operation = mutationQueue.then(async () => {
+    postCommitCleanupError = null;
     const previous = current;
     // Validate before reserving external resources. The optional publisher owns their rollback.
     const proposed = configSchema.parse(await update(previous));
@@ -812,6 +831,9 @@ export function updateConfig(
     // Keep dependent durable retirement inside the same settings transaction;
     // the next On cannot overtake a published Off's cancellation work.
     await afterPublish?.(next, previous);
+    // Report incomplete post-commit cleanup only after publisher-specific work has
+    // committed. A bridge-port publisher must not mistake this for a failed disk write.
+    if (postCommitCleanupError) throw postCommitCleanupError;
     return next;
   });
   mutationQueue = operation.then(
