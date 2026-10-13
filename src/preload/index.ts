@@ -16,7 +16,7 @@ import type { SkillSummary, ManagedSkill, GitHubSkillUpdateCheck, SkillLibrary, 
 import type { RunningToolActivity, SessionChange, SessionSearchReply, SessionSearchLocation, ToolEditReview } from '../shared/session.js';
 import type { TurnTrace } from '../shared/turn-trace.js';
 import type { RunningExecProcess } from '../shared/background-exec.js';
-import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch } from '../shared/plugins.js';
+import type { PluginSnapshot, PluginInstallRequest, PluginConfigPatch, CodexMcpApproval, CodexMcpCandidate } from '../shared/plugins.js';
 /**
  * The entire renderer-facing API.
  *
@@ -119,6 +119,8 @@ const api = {
   },
   openLegalNotices: () => call<void>('plugins:legalNotices'),
   pluginsSnapshot: () => call<PluginSnapshot>('plugins:snapshot'),
+  pluginsCodexCandidates: () => call<CodexMcpCandidate[]>('plugins:codexCandidates'),
+  pluginsCodexImport: (approval: CodexMcpApproval) => call<PluginSnapshot>('plugins:codexImport', approval),
   pluginsInstall: (request: PluginInstallRequest) => call<PluginSnapshot>('plugins:install', request),
   pluginsConfigure: (id: string, patch: PluginConfigPatch) => call<PluginSnapshot>('plugins:configure', { id, patch }),
   pluginsRestart: (id: string) => call<PluginSnapshot>('plugins:restart', { id }),

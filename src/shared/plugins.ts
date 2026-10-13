@@ -11,6 +11,38 @@ export type PluginSource = {
   auth?: 'oauth';
   path?: string;
 };
+
+/** Passive, never-started configuration preview; credentials and environment values are omitted. */
+export interface CodexMcpCandidate {
+  /** Stable configuration-defined identity; never executable data supplied to install IPC. */
+  id: string;
+  /** Hash of security-relevant source definition. Main re-reads before approval. */
+  fingerprint: string;
+  name: string;
+  sourceKind: 'stdio' | 'http';
+  sourcePath: string;
+  /** Never include raw executable paths, arguments or endpoint paths in IPC previews. */
+  executable?: string;
+  argumentCount?: number;
+  cwd?: string;
+  endpointHost?: string;
+  environmentNames: string[];
+  headerNames: string[];
+  supported: boolean;
+  reason?: string;
+}
+
+/** The user's explicit selection; source/command cannot be supplied from the renderer. */
+export interface CodexMcpApproval {
+  id: string;
+  fingerprint: string;
+}
+
+export interface CodexMcpImportOrigin extends CodexMcpApproval {
+  sourcePath: string;
+  /** A display-only configured working directory, part of the fingerprint. */
+  cwd?: string;
+}
 export interface PluginConfigPatch {
   config?: Record<string, string>;
   credentials?: Record<string, string>;
@@ -65,6 +97,8 @@ export interface PluginView {
   error?: string;
   tools: PluginToolView[];
   installedAt: number;
+  /** Approved import from Codex configuration, revalidated before every server start. */
+  codexImport?: CodexMcpImportOrigin;
 }
 export interface PluginSnapshot {
   plugins: PluginView[];

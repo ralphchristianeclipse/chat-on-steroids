@@ -1,7 +1,7 @@
 import { ui, t } from './i18n.js';
 import type { AppState } from '../shared/types.js';
 import type { SettingsPatch } from '../preload/index.js';
-import type { PluginSnapshot, PluginView, PluginCatalogEntry, PluginSource } from '../shared/plugins.js';
+import type { PluginSnapshot, PluginView, PluginCatalogEntry, PluginSource, CodexMcpCandidate } from '../shared/plugins.js';
 import { $, disclosureChevron, el, run, toast } from './dom.js';
 import { paintSharedTunnel } from './tunnel-warning.js';
 
@@ -158,7 +158,10 @@ function renderInstalled(): void {
     const menu = document.createElement('details'); menu.className = 'plugin-menu';
     const summary = el('summary', '', '•••'); ui(summary, 'aria-label', () => t("Actions for {0}", [plugin.name]));
     const actions = el('div', 'plugin-menu-actions');
-    actions.append(button(() => plugin.enabled ? t("Disable") : t("Enable"), async () => { await mutate(window.api.pluginsSetEnabled(plugin.id, !plugin.enabled)); }), button(() => t("Configure"), () => showConfigure(plugin)), button(() => t("Restart"), async () => { await mutate(window.api.pluginsRestart(plugin.id)); }), button(() => t("Update"), async () => { await mutate(window.api.pluginsUpdate(plugin.id)); }));
+    actions.append(button(() => plugin.enabled ? t("Disable") : t("Enable"), async () => { await mutate(window.api.pluginsSetEnabled(plugin.id, !plugin.enabled)); }));
+    if (!plugin.codexImport) actions.append(button(() => t("Configure"), () => showConfigure(plugin)));
+    actions.append(button(() => t("Restart"), async () => { await mutate(window.api.pluginsRestart(plugin.id)); }));
+    if (!plugin.codexImport) actions.append(button(() => t("Update"), async () => { await mutate(window.api.pluginsUpdate(plugin.id)); }));
     const uninstall = button(() => t("Uninstall"), () => showUninstall(plugin)); uninstall.classList.add('plugin-destructive'); actions.append(uninstall);
     menu.append(summary, actions); card.append(open, menu);
     list.append(card);
@@ -259,6 +262,94 @@ function showCatalog(): void {
   body.append(grid, el('h3', '', () => t("Bring your own server"))); const custom = el('div', 'plugin-actions');
   custom.append(button(() => t("Import MCPB bundle"), async () => { const path = await run(window.api.pluginsImportBundle()); if (path) showCustom('mcpb', path); }), button(() => t("npm / Python / executable"), () => showCustom('npm')), button(() => t("Remote MCP URL"), () => showCustom('remote')), button(() => t("GitHub repository"), () => showCustom('github')));
   body.append(custom, el('p', 'hint', () => t("Local plugins run as your OS user and do not inherit CoS approved-folder restrictions. Install only code you trust.")));
+  body.append(el('h3', '', () => t("Codex MCP servers")));
+  body.append(el('p', 'hint', () => t("Discover configured Codex MCP servers without starting them. Each server requires separate review and approval before installation.")));
+  body.append(button(() => t("Import from Codex"), showCodexImport));
+}
+/** Codex discovery is read-only; only the reviewed id+fingerprint crosses the install IPC. */
+async function showCodexImport(): Promise<void> {
+  const { box, body } = dialog(() => t("Import from Codex"));
+  body.append(el('p', 'hint', () => t("Listing Codex servers does not run or contact them. Imported local servers execute as your OS user, outside approved-folder restrictions; HTTP servers connect to their configured endpoint.")));
+  const list = el('div', 'plugin-tools'); list.dataset.codexCandidates = '';
+  body.append(list);
+  const reload = async (): Promise<void> => {
+    list.replaceChildren(el('p', 'muted', () => t("Checking Codex configuration…")));
+    const candidates = await run(window.api.pluginsCodexCandidates());
+    if (!box.isConnected) return;
+    if (candidates === null) {
+      list.replaceChildren(el('p', 'plugin-error', () => t("Unable to read Codex configuration. Refresh candidates to try again.")));
+      return;
+    }
+    list.replaceChildren();
+    if (!candidates.length) {
+      list.append(el('p', 'muted', () => t("No Codex MCP servers were found.")));
+      return;
+    }
+    for (const candidate of candidates) {
+      const row = el('div', 'plugin-tool');
+      const description = el('span');
+      const previous = snapshot.plugins.find(plugin => plugin.codexImport?.id === candidate.id);
+      const alreadyApproved = !!previous && previous.codexImport?.fingerprint === candidate.fingerprint;
+      const status = !candidate.supported ? candidate.reason ?? t("Import unsupported")
+        : alreadyApproved ? t("Already imported · current configuration")
+        : previous ? t("Configuration changed · reapproval required") : t("Not imported");
+      description.append(el('b', '', candidate.name),
+        el('small', 'muted', candidate.executable ?? candidate.endpointHost ?? candidate.sourcePath),
+        el('small', 'muted', status));
+      const review = button(() => t("Review configuration"), () => showCodexReview(candidate));
+      row.append(description, review);
+      list.append(row);
+    }
+  };
+  body.append(button(() => t("Refresh candidates"), reload));
+  await reload();
+}
+function showCodexReview(candidate: CodexMcpCandidate): void {
+  const { box, body } = dialog(() => t("Review Codex server: {0}", [candidate.name]));
+  const previous = snapshot.plugins.find(plugin => plugin.codexImport?.id === candidate.id);
+  const alreadyApproved = !!previous && previous.codexImport?.fingerprint === candidate.fingerprint;
+  body.append(el('p', 'hint', () => candidate.sourceKind === 'stdio'
+    ? t("Review the complete command and arguments in the listed Codex configuration file before approving. Potentially sensitive argument values are deliberately not sent to this screen. Local code runs outside approved-folder restrictions as your OS user.")
+    : t("Review the exact URL in the Codex configuration file before approving. Only the host and header names are shown here; URL paths and credential values are withheld.")));
+  const details: Array<[string, string]> = [
+    [t("Codex configuration file"), candidate.sourcePath],
+    [t("Transport"), candidate.sourceKind],
+    [t("Executable"), candidate.executable ?? t("Not applicable")],
+    [t("Argument count"), String(candidate.argumentCount ?? 0)],
+    [t("Working directory"), candidate.cwd ?? t("Plugins-managed data directory (not a Codex project)")],
+    [t("HTTP endpoint host"), candidate.endpointHost ?? t("Not applicable")],
+    [t("Environment variable names (values hidden)"), candidate.environmentNames.length ? candidate.environmentNames.join(', ') : t("None")],
+    [t("Header names (values hidden)"), candidate.headerNames.length ? candidate.headerNames.join(', ') : t("None")]
+  ];
+  for (const [title, value] of details) {
+    const row = el('div', 'plugin-field');
+    row.append(el('strong', '', title), el('p', 'plugin-source', value));
+    body.append(row);
+  }
+  if (!candidate.supported) body.append(el('p', 'plugin-error', candidate.reason ?? t("This Codex server cannot be imported.")));
+  if (alreadyApproved) body.append(el('p', 'hint', () => t("This exact Codex configuration is already imported. Changes require a fresh review.")));
+  else if (previous) body.append(el('p', 'plugin-error', () => t("This Codex configuration changed since the last approval. Review all fields before reapproving.")));
+  const consent = el('label', 'plugin-tool');
+  const approved = document.createElement('input'); approved.type = 'checkbox';
+  approved.disabled = !candidate.supported || alreadyApproved;
+  consent.append(approved, el('span', '', () => t("I reviewed this server's command, arguments, working directory and environment names. I explicitly approve installing and running it.")));
+  body.append(consent);
+  const actions = el('div', 'plugin-actions');
+  const install = button(() => t(previous ? "Reapprove and reconnect" : "Import and approve"), async () => {
+    if (!approved.checked) return;
+    // The main process must reread Codex config and reject a stale fingerprint.
+    if (await mutate(window.api.pluginsCodexImport({ id: candidate.id, fingerprint: candidate.fingerprint }))) box.close();
+    else {
+      approved.checked = false;
+      approved.disabled = true;
+      install.disabled = true;
+      body.append(el('p', 'plugin-error', () => t("Import was not confirmed. Refresh candidates and review the configuration again before retrying.")));
+    }
+  }, true);
+  install.disabled = true;
+  approved.addEventListener('change', () => { install.disabled = !approved.checked || !candidate.supported || alreadyApproved; });
+  actions.append(install, button(() => t("Back to candidates"), showCodexImport));
+  body.append(actions, el('p', 'hint', () => t("If this server's Codex configuration changes, refresh candidates and review the new configuration before approving again.")));
 }
 function showRecipe(recipe: PluginCatalogEntry): void {
   const { box, body } = dialog(() => t("Set up {0}", [recipe.name])); const header = el('div', 'plugin-card-head'); header.append(art(recipe.icon), el('p', '', () => t(recipe.description))); body.append(header);

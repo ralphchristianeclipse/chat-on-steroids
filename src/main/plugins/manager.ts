@@ -1,4 +1,5 @@
 import { promises as fs } from 'node:fs';
+import * as fsSync from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ToolSchema } from '@modelcontextprotocol/core';
@@ -9,13 +10,15 @@ import { getSecret, setSecret, clearSecret } from '../secrets.js';
 import { readDurable, writeDurableNow } from '../durable.js';
 import { setEnvValue } from '../env.js';
 import { redactCredentialText } from '../redaction.js';
-import type { PluginConfigPatch, PluginInstallRequest, PluginSnapshot, PluginView } from '../../shared/plugins.js';
+import type { CodexMcpApproval, CodexMcpCandidate, CodexMcpImportOrigin, PluginConfigPatch, PluginInstallRequest, PluginSnapshot, PluginView } from '../../shared/plugins.js';
+import { loadCodexMcpCandidates, resolveApprovedCodex } from './codex-import-bridge.js';
 import { installSource, pluginEnvironment, resolveGithub, stopInstallers, type InstalledLaunch } from './installer.js';
 import { terminateProcessTree } from '../exec.js';
 import { pluginCatalog, reviewedPluginLicense } from './catalog.js';
 import sharp from 'sharp';
 import { pluginExposure } from './exposure.js';
 import { logWarn } from '../logger.js';
+import { onConfigPublished } from '../config.js';
 import { SURFACES, surfaceDefinition } from '../mcp/surfaces.js';
 
 /**
@@ -96,6 +99,96 @@ export class PluginManager {
   private closing = false;
   private connecting = new Map<Client, StdioClientTransport | undefined>();
   private authenticating = new Map<string, { controller: AbortController; promise: Promise<void> }>();
+  private codexWatchers = new Map<string, { file: string; listener: () => void }>();
+  private unwatchConfig?: () => void;
+  private codexPolicyEpoch = new Map<string, number>();
+
+  /** Static file parsing only. This API never opens a transport or starts a process. */
+  async codexCandidates(): Promise<CodexMcpCandidate[]> {
+    return loadCodexMcpCandidates();
+  }
+  private async currentCodexCandidate(origin: CodexMcpImportOrigin): Promise<CodexMcpCandidate | null> {
+    const candidate = (await this.codexCandidates()).find(item => item.id === origin.id && item.fingerprint === origin.fingerprint);
+    if (!candidate || !candidate.supported || candidate.environmentNames.length || candidate.headerNames.length ||
+        (origin.cwd ?? '') !== (candidate.cwd ?? '')) return null;
+    return candidate;
+  }
+  private async hasCodexApproval(row: RecordEntry): Promise<boolean> {
+    if (!row.codexImport) return true;
+    const candidate = await this.currentCodexCandidate(row.codexImport);
+    if (!candidate) return false;
+    const { source } = await resolveApprovedCodex(row.codexImport);
+    return JSON.stringify(source) === JSON.stringify(row.source);
+  }
+  private watchCodex(row: RecordEntry): void {
+    if (!row.codexImport || this.codexWatchers.has(row.id)) return;
+    // Watch the canonical config source, not a renderer-chosen executable or folder.
+    // Polling detects atomic editor replacements as well as ordinary in-place writes.
+    const candidateFile = path.resolve(row.codexImport.sourcePath);
+    const listener = () => { void this.revokeChangedCodex(row).catch(() => undefined); };
+    fsSync.watchFile(candidateFile, { interval: 1500, persistent: false }, listener);
+    this.codexWatchers.set(row.id, { file: candidateFile, listener });
+  }
+  private async revokeChangedCodex(row: RecordEntry): Promise<void> {
+    if (row.enabled && !(await this.hasCodexApproval(row).catch(() => false))) {
+      row.error = 'Codex MCP configuration changed. Remove and re-import to approve the new command.';
+      await this.setEnabled(row.id, false);
+    }
+  }
+
+  /** Approval is resolved only from a fresh main-process parse, never the renderer's command. */
+  async importCodex(approval: CodexMcpApproval): Promise<PluginSnapshot> {
+    const { candidate, source } = await resolveApprovedCodex(approval);
+    const existing = this.records.find(row => row.codexImport?.id === candidate.id);
+    if (existing) {
+      if (existing.codexImport?.fingerprint === candidate.fingerprint) {
+        throw new Error('This exact Codex MCP configuration is already approved.');
+      }
+      return this.serial(existing.id, async () => {
+        const epoch = this.codexPolicyEpoch.get(existing.id) ?? 0;
+        // The old approval is revoked before any asynchronous re-installation.
+        existing.enabled = false;
+        await this.disconnect(existing);
+        const previousDirectory = existing.directory;
+        let newDirectory: string | undefined;
+        try {
+          const fresh = await resolveApprovedCodex(approval);
+          newDirectory = await this.createGeneration(existing.id);
+          const launch = await installSource(fresh.source, newDirectory);
+          if (this.closing || !this.records.includes(existing) ||
+              (this.codexPolicyEpoch.get(existing.id) ?? 0) !== epoch) {
+            throw new Error('Codex MCP reapproval was cancelled by a newer disable/uninstall request.');
+          }
+          Object.assign(existing, {
+            source: fresh.source, launch, directory: newDirectory,
+            version: launch.version, license: launch.license, catalog: [], disabledTools: [],
+            codexImport: { id: fresh.candidate.id, fingerprint: fresh.candidate.fingerprint,
+              sourcePath: fresh.candidate.sourcePath,
+              ...(fresh.candidate.cwd ? { cwd: fresh.candidate.cwd } : {}) },
+            error: undefined, status: 'installed', enabled: true
+          });
+          await this.save();
+          await this.connect(existing);
+          this.changed();
+          await removePluginFolder(previousDirectory).catch(() => undefined);
+          return this.snapshot();
+        } catch (error) {
+          // Never roll back into the old, now-unauthorized executable.
+          existing.enabled = false;
+          existing.status = 'disabled';
+          await this.save();
+          this.changed();
+          if (newDirectory && newDirectory !== existing.directory)
+            await removePluginFolder(newDirectory).catch(() => undefined);
+          throw error;
+        }
+      });
+    }
+    return this.install({ name: candidate.name, source }, {
+      id: candidate.id, fingerprint: candidate.fingerprint,
+      sourcePath: candidate.sourcePath, ...(candidate.cwd ? { cwd: candidate.cwd } : {})
+    });
+  }
   onChanged(listener: () => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -120,6 +213,12 @@ export class PluginManager {
   async initialize(userDataDir: string): Promise<void> {
     this.root = path.join(userDataDir, 'plugins');
     this.closing = false;
+    this.unwatchConfig?.();
+    this.unwatchConfig = onConfigPublished(async (next, previous) => {
+      if (JSON.stringify(next.roots) === JSON.stringify(previous.roots)) return;
+      await Promise.all(this.records.filter(row => row.codexImport && row.enabled)
+        .map(row => this.revokeChangedCodex(row)));
+    });
     await fs.mkdir(this.root, { recursive: true });
     const stored = await readDurable<RecordEntry[]>('plugins');
     this.records = Array.isArray(stored) && stored.length <= 24
@@ -129,6 +228,20 @@ export class PluginManager {
         return { ...record, catalog, status: record.enabled ? 'connecting' : 'disabled' };
       })
       : [];
+    // No imported server can auto-start from a stored approval after its Codex
+    // definition changes. Recheck on startup before any background connect.
+    let changedApprovals = false;
+    for (const row of this.records) {
+      if (!row.codexImport) continue;
+      if (row.enabled && !(await this.hasCodexApproval(row).catch(() => false))) {
+        row.enabled = false;
+        row.error = 'Codex MCP configuration changed. Remove and re-import to approve.';
+        row.status = 'disabled';
+        changedApprovals = true;
+      }
+      this.watchCodex(row);
+    }
+    if (changedApprovals) await this.save();
     this.changed();
     // Installation + enabled policy owns the runtime. Restore connections in the
     // background so slow external servers never delay the app's first window.
@@ -147,6 +260,11 @@ export class PluginManager {
       schemaRevision: this.revision,
       plugins: this.records.map(({ directory: _, launch: __, disabledTools, catalog, ...row }) => ({
         ...row,
+        // An imported Codex command/URL may itself contain private credentials.
+        // Its raw definition never crosses into the renderer or diagnostic snapshots.
+        ...(row.codexImport ? { source: row.source.kind === 'remote'
+          ? { kind: 'remote' as const, url: '[Codex config — details hidden]' }
+          : { kind: 'command' as const, command: '[Codex config — details hidden]', args: [] } } : {}),
         license: reviewedPluginLicense({ ...row.source, version: row.version }, row.license),
         tools: catalog.map(tool => ({
           name: tool.name, exposedName: tool.name, description: tool.description,
@@ -230,6 +348,12 @@ export class PluginManager {
       )
         return false;
       if (!path.resolve(p.directory).startsWith(path.resolve(this.root, p.id) + path.sep)) return false;
+      if (p.codexImport && (
+        typeof p.codexImport.id !== 'string' || typeof p.codexImport.fingerprint !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(p.codexImport.fingerprint) ||
+        typeof p.codexImport.sourcePath !== 'string' || !path.isAbsolute(p.codexImport.sourcePath) ||
+        (p.codexImport.cwd !== undefined && (typeof p.codexImport.cwd !== 'string' || !path.isAbsolute(p.codexImport.cwd)))
+      )) return false;
       this.validateConfig(p.config);
       if (p.launch.manifest) vAny.McpbManifestSchema.parse(p.launch.manifest);
       return true;
@@ -290,9 +414,20 @@ export class PluginManager {
     // directory. Another UUID consumes 28 avoidable characters of Windows MAX_PATH.
     return fs.mkdtemp(path.join(parent, 'g-'));
   }
-  install(request: PluginInstallRequest): Promise<PluginSnapshot> {
+  install(request: PluginInstallRequest, codexImport?: CodexMcpImportOrigin): Promise<PluginSnapshot> {
     return this.serial('install', async () => {
       if (this.closing) throw new Error('Plugins are shutting down');
+      if (codexImport) {
+        if (this.records.some(row => row.codexImport?.id === codexImport.id)) {
+          throw new Error('This Codex MCP server is already imported. Remove it before reapproving.');
+        }
+        const { candidate, source: currentSource } = await resolveApprovedCodex(codexImport);
+        if (candidate.sourcePath !== codexImport.sourcePath ||
+            (candidate.cwd ?? '') !== (codexImport.cwd ?? '') ||
+            JSON.stringify(currentSource) !== JSON.stringify(request.source)) {
+          throw new Error('Codex MCP definition changed before installation. Scan again.');
+        }
+      }
       if (this.records.length >= 24) throw new Error('At most 24 plugins may be installed');
       const catalog = pluginCatalog.find((p) => p.id === request.catalogId);
       let source = structuredClone(request.source ?? catalog?.source);
@@ -324,6 +459,7 @@ export class PluginManager {
           directory,
           launch,
           disabledTools: [],
+          ...(codexImport ? { codexImport } : {}),
           ...this.installationMetadata(launch, catalog?.id),
         };
         if (launch.manifest) {
@@ -341,6 +477,7 @@ export class PluginManager {
           this.exposureCache = null;
           throw e;
         }
+        if (codexImport) this.watchCodex(row);
         await this.connect(row);
         this.changed();
         return this.snapshot();
@@ -357,6 +494,7 @@ export class PluginManager {
     this.authenticating.get(id)?.controller.abort();
     return this.serial(id, async () => {
       const row = this.row(id);
+      if (row.codexImport) throw new Error('Imported Codex MCP definitions are immutable. Remove and re-import after changing config.');
       this.validateConfig(patch.config ?? row.config);
       if (row.fields?.some((f) => f.secret && f.key in (patch.config ?? row.config)))
         throw new Error('Store sensitive bundle fields in secure credentials');
@@ -403,6 +541,7 @@ export class PluginManager {
     this.authenticating.get(id)?.controller.abort();
     return this.serial(id, async () => {
       const row = this.row(id);
+      if (row.codexImport) throw new Error('Imported Codex MCP updates require explicit removal and reapproval.');
       const catalog = pluginCatalog.find((p) => p.id === row.catalogId);
       await this.replace(row, catalog?.source ?? row.source, row.config);
       this.changed();
@@ -415,6 +554,7 @@ export class PluginManager {
     config: Record<string, string>,
   ): Promise<void> {
     if (this.closing) throw new Error('Plugins are shutting down');
+    if (row.codexImport) throw new Error('Imported Codex MCP sources may only change through renewed approval.');
     if (source.auth && source.kind !== 'remote') throw new Error('OAuth requires a remote source.');
     if (source.kind === 'github') source = resolveGithub(source);
     if (source.kind === 'remote') this.remoteUrl(source.url);
@@ -448,6 +588,21 @@ export class PluginManager {
   }
   setEnabled(id: string, enabled: boolean): Promise<PluginSnapshot> {
     const row = this.row(id);
+    if (row.codexImport) this.codexPolicyEpoch.set(id, (this.codexPolicyEpoch.get(id) ?? 0) + 1);
+    if (enabled && row.codexImport) {
+      // Never briefly expose an expired retained tool catalog before async
+      // fingerprint validation. A new approval always requires re-import.
+      return this.serial(id, async () => {
+        if (!(await this.hasCodexApproval(row).catch(() => false))) {
+          throw new Error('Codex MCP configuration changed. Remove and re-import to approve.');
+        }
+        row.enabled = true;
+        await this.save();
+        await this.connect(row);
+        this.changed();
+        return this.snapshot();
+      });
+    }
     // The record is the live policy authority, including while lifecycle work is queued.
     row.enabled = enabled;
     // Revocation retires the current identity now, even while an update downloads
@@ -478,6 +633,9 @@ export class PluginManager {
   }
   uninstall(id: string): Promise<PluginSnapshot> {
     const row = this.row(id);
+    if (row.codexImport) this.codexPolicyEpoch.set(id, (this.codexPolicyEpoch.get(id) ?? 0) + 1);
+    const watched = this.codexWatchers.get(id);
+    if (watched) { fsSync.unwatchFile(watched.file, watched.listener); this.codexWatchers.delete(id); }
     row.enabled = false;
     const retirement = this.disconnect(row);
     void retirement.catch(() => undefined);
@@ -631,6 +789,14 @@ export class PluginManager {
   }
   private async startConnection(row: RecordEntry, signal: AbortSignal): Promise<void> {
     if (this.closing || !row.enabled) return;
+    if (row.codexImport && !(await this.hasCodexApproval(row).catch(() => false))) {
+      row.enabled = false;
+      row.status = 'disabled';
+      row.error = 'Codex MCP configuration changed. Remove and re-import to approve.';
+      await this.save();
+      this.changed();
+      return;
+    }
     row.status = 'connecting';
     row.error = undefined;
     this.changed();
@@ -728,7 +894,7 @@ export class PluginManager {
         transport = new StdioClientTransport({
           command: launch.command,
           args: launch.args,
-          cwd: data,
+          cwd: row.codexImport?.cwd ?? data,
           env,
           stderr: 'ignore',
           maxBufferSize: 16 * 1024 * 1024,
@@ -802,7 +968,8 @@ export class PluginManager {
       if (!signal.aborted) {
         const needsAuth = e instanceof PluginNeedsAuth || e instanceof UnauthorizedError;
         row.status = needsAuth ? 'needs-auth' : 'error';
-        row.error = row.source.auth === 'oauth' ? needsAuth ? 'Sign in to connect this plugin.' : 'The OAuth server could not connect. Check its setup and try again.' : String(this.redact((e as Error).message)).slice(0, 600);
+        row.error = row.codexImport ? 'Imported Codex MCP server could not start. Inspect its configuration and approve changes explicitly.'
+          : row.source.auth === 'oauth' ? needsAuth ? 'Sign in to connect this plugin.' : 'The OAuth server could not connect. Check its setup and try again.' : String(this.redact((e as Error).message)).slice(0, 600);
       }
     } finally {
       signal.removeEventListener('abort', retire);
@@ -878,6 +1045,13 @@ export class PluginManager {
     }
     const { row, live, tool } = acquired;
     try {
+      if (row.codexImport && !(await this.hasCodexApproval(row).catch(() => false))) {
+        await this.setEnabled(row.id, false);
+        return refused('CODEX_APPROVAL_EXPIRED: Codex MCP definition changed. Remove and re-import this server.');
+      }
+      if (!row.enabled || this.live.get(row.id) !== live) {
+        return refused('CODEX_APPROVAL_REVOKED: This plugin has been disabled before dispatch.');
+      }
       // Supply our bounded discovery result: SDK validates output against it without
       // rediscovery or the modern header-mismatch retry path for ambiguous mutations.
       const result = await live.client.callTool({ name: tool.name, arguments: args }, { timeout: 120000, toolDefinition: tool });
@@ -915,6 +1089,10 @@ export class PluginManager {
   }
   async close(): Promise<void> {
     this.closing = true;
+    this.unwatchConfig?.();
+    this.unwatchConfig = undefined;
+    for (const { file, listener } of this.codexWatchers.values()) fsSync.unwatchFile(file, listener);
+    this.codexWatchers.clear();
     for (const operation of this.starting.values()) operation.controller.abort();
     await Promise.all(this.records.map(row => this.disconnect(row)));
     await stopInstallers();

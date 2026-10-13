@@ -790,6 +790,13 @@ async function persistConfig(parsed: Config): Promise<Config> {
   return current;
 }
 
+/** Import owners can retire approved external code when an approved folder is revoked. */
+const configPublished = new Set<(next: Config, previous: Config) => Promise<void> | void>();
+export function onConfigPublished(listener: (next: Config, previous: Config) => Promise<void> | void): () => void {
+  configPublished.add(listener);
+  return () => { configPublished.delete(listener); };
+}
+
 /**
  * Atomically updates settings from the latest committed state.
  *
@@ -812,6 +819,11 @@ export function updateConfig(
     // Keep dependent durable retirement inside the same settings transaction;
     // the next On cannot overtake a published Off's cancellation work.
     await afterPublish?.(next, previous);
+    if (next !== previous && configPublished.size) {
+      const outcomes = await Promise.allSettled([...configPublished].map(listener => listener(next, previous)));
+      if (outcomes.some(outcome => outcome.status === 'rejected'))
+        throw new Error('Settings were saved, but an imported MCP process could not be retired. Restart Chat On Steroids to complete access revocation.');
+    }
     return next;
   });
   mutationQueue = operation.then(

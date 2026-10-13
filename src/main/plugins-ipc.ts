@@ -29,6 +29,16 @@ export function registerPluginIpc(
     if (error) throw new Error('Could not open the bundled Third-party Notices file.');
   });
   handle('plugins:snapshot', async () => pluginManager.snapshot());
+  handle('plugins:codexCandidates', async () => pluginManager.codexCandidates());
+  handle('plugins:codexImport', async payload => {
+    // Renderer chooses an identity/fingerprint only. The executable, arguments
+    // and environment are re-read and checked in the main process.
+    const approved = z.object({
+      id: z.string().min(1).max(512),
+      fingerprint: z.string().regex(/^[a-f0-9]{64}$/)
+    }).strict().parse(payload);
+    return pluginManager.importCodex(approved);
+  });
   handle('plugins:install', async payload => { await pluginManager.install(install.parse(payload)); return pluginManager.snapshot(); });
   handle('plugins:configure', async payload => {
     const input = identity.extend({ patch }).strict().parse(payload);

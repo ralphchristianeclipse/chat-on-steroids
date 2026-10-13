@@ -4191,6 +4191,21 @@ reviewed entries; `installer.ts` owns installation/package materialization; `man
 stdio/remote clients; `exposure.ts` owns accepted live tools; `oauth.ts` owns authorization.
 Local npm/Python/MCPB packages and remote endpoints have different setup needs. Editor plugins
 such as Blender also need the editor-side addon and a successful readiness probe.
+The opt-in Codex MCP importer is part of **Plugins**, not a new Core broker: the
+renderer invokes `plugins:codexCandidates` to read user `config.toml` and approved
+local-project `.codex/config.toml` without spawning or connecting to any server.
+The UI receives bounded fingerprints, executable basenames, argument counts,
+endpoint hosts and environment/header **names**, never raw arguments, URL paths
+or credential values. After explicit per-server consent it submits only
+`{id,fingerprint}` to `plugins:codexImport`; main re-reads the exact definition,
+checks its full security fingerprint and then uses the existing Plugins install
+and exposure lifecycle. Imported servers with env/header secrets or Codex-only
+tool restrictions are listed as unsupported rather than silently broadening
+access or copying plaintext credentials. Imported approvals are persistent but
+invalidated before startup/calls when the command, URL, arguments, disabled state
+or relevant configuration changes; file changes and revoked project roots retire
+active servers, and reapproval must be explicit. Imported source edits through
+generic Configure/Update are prohibited; other Plugins keep existing behavior.
 Each local installation keeps its stable plugin UUID and an exclusively created short
 generation directory. Replacement preserves the old working generation until publication;
 short generation names leave room for nested Python package data on Windows. Existing stored
